@@ -1,19 +1,14 @@
 from troposphere import (
-    AWS_ACCOUNT_ID,
     AWS_REGION,
     AWS_STACK_ID,
     AWS_STACK_NAME,
     autoscaling,
     Base64,
     cloudformation,
-    elasticloadbalancing as elb,
-    Equals,
     FindInMap,
     GetAtt,
     iam,
     Join,
-    logs,
-    Not,
     Output,
     Parameter,
     Ref,
@@ -26,13 +21,16 @@ from troposphere.ec2 import (
 
 from troposphere.ecs import (
     Cluster,
-    ContainerDefinition,
-    Environment,
+)
+
+from troposphere.elasticloadbalancingv2 import (
+    Action,
+    Certificate,
+    Listener,
     LoadBalancer,
-    LogConfiguration,
-    PortMapping,
-    Service,
-    TaskDefinition,
+    Matcher,
+    TargetGroup,
+    TargetGroupAttribute,
 )
 
 from awacs import ecr
@@ -49,16 +47,7 @@ from .vpc import (
 )
 from .assets import (
     assets_bucket,
-    distribution,
 )
-from .database import (
-    db_instance,
-    db_name,
-    db_user,
-    db_password,
-)
-from .domain import domain_name
-from .repository import repository
 from .certificates import application as application_certificate
 
 
@@ -79,30 +68,6 @@ web_worker_port = Ref(template.add_parameter(Parameter(
 )))
 
 
-web_worker_cpu = Ref(template.add_parameter(Parameter(
-    "WebWorkerCPU",
-    Description="Web worker CPU units",
-    Type="Number",
-    Default="512",
-)))
-
-
-web_worker_memory = Ref(template.add_parameter(Parameter(
-    "WebWorkerMemory",
-    Description="Web worker memory",
-    Type="Number",
-    Default="700",
-)))
-
-
-web_worker_desired_count = Ref(template.add_parameter(Parameter(
-    "WebWorkerDesiredCount",
-    Description="Web worker task instance count",
-    Type="Number",
-    Default="2",
-)))
-
-
 max_container_instances = Ref(template.add_parameter(Parameter(
     "MaxScale",
     Description="Maximum container instances count",
@@ -119,25 +84,6 @@ desired_container_instances = Ref(template.add_parameter(Parameter(
 )))
 
 
-app_revision = Ref(template.add_parameter(Parameter(
-    "WebAppRevision",
-    Description="An optional docker app revision to deploy",
-    Type="String",
-    Default="",
-)))
-
-
-deploy_condition = "Deploy"
-template.add_condition(deploy_condition, Not(Equals(app_revision, "")))
-
-
-secret_key = Ref(template.add_parameter(Parameter(
-    "SecretKey",
-    Description="Application secret key",
-    Type="String",
-)))
-
-
 template.add_mapping("ECSRegionMap", {
     "us-east-1": {"AMI": "ami-eca289fb"},
     "us-east-2": {"AMI": "ami-446f3521"},
@@ -149,6 +95,31 @@ template.add_mapping("ECSRegionMap", {
     "ap-southeast-1": {"AMI": "ami-a900a3ca"},
     "ap-southeast-2": {"AMI": "ami-5781be34"},
 })
+
+
+# Target group
+application_target_group = TargetGroup(
+    'ApplicationTargetGroup',
+    template=template,
+    VpcId=Ref(vpc),
+    Matcher=Matcher(
+        HttpCode='200-299',
+    ),
+    Port=80,
+    Protocol='HTTP',
+    HealthCheckIntervalSeconds=15,
+    HealthCheckPath='/health-check',
+    HealthCheckProtocol='HTTP',
+    HealthCheckTimeoutSeconds=5,
+    HealthyThresholdCount=2,
+    UnhealthyThresholdCount=8,
+    TargetGroupAttributes=[
+        TargetGroupAttribute(
+            Key='stickiness.enabled',
+            Value='true',
+        )
+    ],
+)
 
 
 # Web load balancer
@@ -167,36 +138,39 @@ load_balancer_security_group = SecurityGroup(
     ],
 )
 
-load_balancer = elb.LoadBalancer(
-    'LoadBalancer',
+
+application_load_balancer = LoadBalancer(
+    'ApplicationLoadBalancer',
     template=template,
     Subnets=[
         Ref(loadbalancer_a_subnet),
         Ref(loadbalancer_b_subnet),
     ],
     SecurityGroups=[Ref(load_balancer_security_group)],
-    Listeners=[elb.Listener(
-        LoadBalancerPort=443,
-        InstanceProtocol='HTTP',
-        InstancePort=web_worker_port,
-        Protocol='HTTPS',
-        SSLCertificateId=application_certificate,
-    )],
-    HealthCheck=elb.HealthCheck(
-        Target=Join("", ["HTTP:", web_worker_port, "/health-check"]),
-        HealthyThreshold="2",
-        UnhealthyThreshold="2",
-        Interval="100",
-        Timeout="10",
-    ),
-    CrossZone=True,
 )
+
 
 template.add_output(Output(
     "LoadBalancerDNSName",
     Description="Loadbalancer DNS",
-    Value=GetAtt(load_balancer, "DNSName")
+    Value=GetAtt(application_load_balancer, "DNSName")
 ))
+
+
+application_listener = Listener(
+    'ApplicationListener',
+    template=template,
+    Certificates=[Certificate(
+        CertificateArn=application_certificate,
+    )],
+    LoadBalancerArn=Ref(application_load_balancer),
+    Protocol='HTTPS',
+    Port=443,
+    DefaultActions=[Action(
+        TargetGroupArn=Ref(application_target_group),
+        Type='forward',
+    )]
+)
 
 
 # ECS cluster
@@ -421,93 +395,8 @@ autoscaling_group = autoscaling.AutoScalingGroup(
     MaxSize=max_container_instances,
     DesiredCapacity=desired_container_instances,
     LaunchConfigurationName=Ref(container_instance_configuration),
-    LoadBalancerNames=[Ref(load_balancer)],
-    # Since one instance within the group is a reserved slot
-    # for rolling ECS service upgrade, it's not possible to rely
-    # on a "dockerized" `ELB` health-check, else this reserved
-    # instance will be flagged as `unhealthy` and won't stop respawning'
     HealthCheckType="EC2",
     HealthCheckGracePeriod=300,
-)
-
-
-web_log_group = logs.LogGroup(
-    "WebLogs",
-    template=template,
-    RetentionInDays=365,
-    DeletionPolicy="Retain",
-)
-
-
-# ECS task
-web_task_definition = TaskDefinition(
-    "WebTask",
-    template=template,
-    Condition=deploy_condition,
-    ContainerDefinitions=[
-        ContainerDefinition(
-            Name="WebWorker",
-            #  1024 is full CPU
-            Cpu=web_worker_cpu,
-            Memory=web_worker_memory,
-            Essential=True,
-            Image=Join("", [
-                Ref(AWS_ACCOUNT_ID),
-                ".dkr.ecr.",
-                Ref(AWS_REGION),
-                ".amazonaws.com/",
-                Ref(repository),
-                ":",
-                app_revision,
-            ]),
-            PortMappings=[PortMapping(
-                ContainerPort=web_worker_port,
-                HostPort=web_worker_port,
-            )],
-            LogConfiguration=LogConfiguration(
-                LogDriver="awslogs",
-                Options={
-                    'awslogs-group': Ref(web_log_group),
-                    'awslogs-region': Ref(AWS_REGION),
-                }
-            ),
-            Environment=[
-                Environment(
-                    Name="AWS_STORAGE_BUCKET_NAME",
-                    Value=Ref(assets_bucket),
-                ),
-                Environment(
-                    Name="CDN_DOMAIN_NAME",
-                    Value=GetAtt(distribution, "DomainName"),
-                ),
-                Environment(
-                    Name="DOMAIN_NAME",
-                    Value=domain_name,
-                ),
-                Environment(
-                    Name="PORT",
-                    Value=web_worker_port,
-                ),
-                Environment(
-                    Name="SECRET_KEY",
-                    Value=secret_key,
-                ),
-                Environment(
-                    Name="DATABASE_URL",
-                    Value=Join("", [
-                        "postgres://",
-                        Ref(db_user),
-                        ":",
-                        Ref(db_password),
-                        "@",
-                        GetAtt(db_instance, 'Endpoint.Address'),
-                        "/",
-                        Ref(db_name),
-                    ]),
-                ),
-            ],
-        )
-    ],
 )
 
 
@@ -540,21 +429,4 @@ app_service_role = iam.Role(
             ),
         ),
     ]
-)
-
-
-app_service = Service(
-    "AppService",
-    template=template,
-    Cluster=Ref(cluster),
-    Condition=deploy_condition,
-    DependsOn=[autoscaling_group_name],
-    DesiredCount=web_worker_desired_count,
-    LoadBalancers=[LoadBalancer(
-        ContainerName="WebWorker",
-        ContainerPort=web_worker_port,
-        LoadBalancerName=Ref(load_balancer),
-    )],
-    TaskDefinition=Ref(web_task_definition),
-    Role=Ref(app_service_role),
 )
